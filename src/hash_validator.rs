@@ -10,6 +10,11 @@ pub enum HashAlgorithm {
     SHA256,
     SHA512,
 }
+// #[derive(Debug, PartialEq, Eq)]
+// pub enum HashAlgorithm {
+//     SHA256,
+//     SHA512,
+// }
 
 pub struct HashValidator;
 
