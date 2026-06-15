@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, BytesN, Env};
+use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +21,12 @@ pub struct DocumentRecord {
 #[contracttype]
 pub enum DataKey {
     Document(BytesN<32>),
+}
+
+#[contracterror]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContractError {
+    DocumentNotFound = 1,
 }
 
 #[contractevent(topics = ["register"], data_format = "vec")]
