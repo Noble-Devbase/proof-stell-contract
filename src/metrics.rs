@@ -6,6 +6,8 @@ pub struct MetricsRegistry {
     request_count: Counter,
     cache_hits: Counter,
     cache_misses: Counter,
+    cache_expired: Counter,
+    cache_serialization_failures: Counter,
     error_count: Counter,
 }
 
@@ -21,11 +23,19 @@ impl MetricsRegistry {
         let request_count = Counter::new("requests_total", "Total number of requests").unwrap();
         let cache_hits = Counter::new("cache_hits_total", "Total cache hits").unwrap();
         let cache_misses = Counter::new("cache_misses_total", "Total cache misses").unwrap();
+        let cache_expired =
+            Counter::new("cache_expired_total", "Total cache entries returned as miss due to TTL expiry").unwrap();
+        let cache_serialization_failures =
+            Counter::new("cache_serialization_failures_total", "Total cache serialization failures").unwrap();
         let error_count = Counter::new("errors_total", "Total errors").unwrap();
 
         registry.register(Box::new(request_count.clone())).unwrap();
         registry.register(Box::new(cache_hits.clone())).unwrap();
         registry.register(Box::new(cache_misses.clone())).unwrap();
+        registry.register(Box::new(cache_expired.clone())).unwrap();
+        registry
+            .register(Box::new(cache_serialization_failures.clone()))
+            .unwrap();
         registry.register(Box::new(error_count.clone())).unwrap();
 
         Self {
@@ -33,6 +43,8 @@ impl MetricsRegistry {
             request_count,
             cache_hits,
             cache_misses,
+            cache_expired,
+            cache_serialization_failures,
             error_count,
         }
     }
@@ -47,6 +59,14 @@ impl MetricsRegistry {
 
     pub fn increment_cache_misses(&self) {
         self.cache_misses.inc();
+    }
+
+    pub fn increment_cache_expired(&self) {
+        self.cache_expired.inc();
+    }
+
+    pub fn increment_cache_serialization_failures(&self) {
+        self.cache_serialization_failures.inc();
     }
 
     pub fn increment_error_count(&self) {

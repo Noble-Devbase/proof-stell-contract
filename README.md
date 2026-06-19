@@ -123,6 +123,50 @@ cargo test
 
 ---
 
+## 🗄️ Cache Behavior
+
+### TTL Enforcement
+
+Both the in-memory and Redis backends honor TTL values:
+
+- **Redis** — uses `SET EX` so entries are natively evicted after `ttl` seconds.
+- **InMemory** — stores an `expires_at` timestamp alongside each value. A `get` that finds an expired entry returns a cache miss (same semantics as Redis).
+
+The TTL for verification results is controlled by the `CACHE_VERIFICATION_TTL` environment variable (default: `3600` seconds).
+
+### Typed Cache Keys
+
+Cache keys are typed via the `CacheKey` enum to prevent namespace collisions:
+
+| Variant | Prefix | Example |
+|---|---|---|
+| `CacheKey::Verification(hash)` | `verification:` | `verification:e3b0c4…` |
+| `CacheKey::Config(key)` | `config:` | `config:rate_limit` |
+
+Callers must use the appropriate variant — raw string keys are no longer accepted.
+
+### Metrics
+
+The `MetricsRegistry` exposes the following cache-related counters:
+
+| Metric | Description |
+|---|---|
+| `cache_hits_total` | Entry found and returned |
+| `cache_misses_total` | Entry not found |
+| `cache_expired_total` | Entry found but TTL had elapsed (counted as miss) |
+| `cache_serialization_failures_total` | Deserialization error on a cached value |
+
+### Operational Tuning
+
+| Variable | Default | Description |
+|---|---|---|
+| `CACHE_VERIFICATION_TTL` | `3600` | Seconds before a cached verification result expires |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection string (production) |
+
+Set `REDIS_URL` to a real Redis instance in production. The in-memory backend is suitable for local development and testing only.
+
+---
+
 ## 🧪 Future Improvements
 
 * Issuer registry system
