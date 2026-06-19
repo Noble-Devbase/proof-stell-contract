@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::CacheKey;
+
 #[derive(Debug, Clone)]
 pub struct StellarClient {
     horizon_url: String,
@@ -26,6 +28,10 @@ impl StellarClient {
             horizon_url: horizon_url.to_string(),
             http_client: reqwest::Client::new(),
         }
+    }
+
+    pub fn verification_cache_key(hash: &str) -> CacheKey {
+        CacheKey::Verification(hash.to_string())
     }
 
     pub async fn check_connection(&self) -> bool {
