@@ -1,8 +1,12 @@
+use std::prelude::v1::*;
 use std::{env, fmt};
+use std::sync::Arc;
 
 use thiserror::Error;
 use stellar_strkey::ed25519::PrivateKey;
 use url::Url;
+
+use crate::metrics::MetricsRegistry;
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -50,7 +54,17 @@ pub enum ConfigError {
 }
 
 impl AppConfig {
+    /// Load configuration from environment variables.
+    ///
+    /// Records validation failures via the provided metrics registry.
     pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_env_with_metrics(None)
+    }
+
+    /// Load configuration from environment variables, recording metrics if a registry is provided.
+    pub fn from_env_with_metrics(
+        metrics: Option<Arc<MetricsRegistry>>,
+    ) -> Result<Self, ConfigError> {
         let mut errors = Vec::new();
 
         // Helper to read env var with default
@@ -190,8 +204,16 @@ impl AppConfig {
             .collect();
 
         if !errors.is_empty() {
+            if let Some(ref m) = metrics {
+                m.increment_config_validation_failure();
+            }
             let joined = errors.join("\n- ");
             return Err(ConfigError::Validation(format!("- {}", joined)));
+        }
+
+        // Successful load
+        if let Some(ref m) = metrics {
+            m.increment_config_reload();
         }
 
         Ok(Self {
@@ -286,7 +308,10 @@ mod tests {
     fn from_env_rejects_invalid_stellar_secret_key() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
-        env::set_var("STELLAR_SECRET_KEY", "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        env::set_var(
+            "STELLAR_SECRET_KEY",
+            "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
 
         let err = AppConfig::from_env().expect_err("config should fail");
         let msg = err.to_string();
@@ -339,5 +364,38 @@ mod tests {
         assert!(!debug.contains("secret-value"));
         assert!(!debug.contains("another-secret"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn from_env_records_config_validation_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var("PORT", "0");
+        env::set_var(
+            "STELLAR_SECRET_KEY",
+            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
+        );
+
+        let metrics = MetricsRegistry::arc();
+        let _err = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics))).expect_err("should fail");
+
+        let output = metrics.render();
+        assert!(output.contains("config_validation_failures_total"));
+    }
+
+    #[test]
+    fn from_env_records_config_reload_on_success() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        env::set_var(
+            "STELLAR_SECRET_KEY",
+            "SBU2RRGLXH3E5CQHTD3ODLDF2BWDCYUSSBLLZ5GNW7JXHDIYKXZWHOKR",
+        );
+
+        let metrics = MetricsRegistry::arc();
+        let _cfg = AppConfig::from_env_with_metrics(Some(Arc::clone(&metrics))).expect("should succeed");
+
+        let output = metrics.render();
+        assert!(output.contains("config_reload_total"));
     }
 }
