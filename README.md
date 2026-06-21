@@ -66,6 +66,19 @@ Horizon proof exists).
 
 ---
 
+### 📦 Batch Operations
+
+* `batch_register_documents` — register up to 20 documents in one transaction
+* `batch_revoke_documents` — revoke up to 20 documents in one transaction
+
+**Atomicity:** All documents succeed or none are written. If any item in the batch fails (e.g. duplicate hash, wrong issuer, already revoked), the entire call returns an error and no state is changed.
+
+**Batch size limit:** Maximum 20 documents per call. Exceeding this returns `BatchTooLarge` (error code 7). Empty batches return `BatchEmpty` (error code 8).
+
+**Fee implications:** A single transaction covers the entire batch regardless of size, making bulk operations significantly cheaper than individual calls. For best results, pre-validate document uniqueness and existence client-side before submitting to avoid wasted transaction fees on partial failures.
+
+---
+
 ## 🧠 How It Works
 
 1. Document is hashed (SHA256)
