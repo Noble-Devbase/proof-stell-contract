@@ -2,6 +2,7 @@
 
 // The service-side modules require std and are only available on non-WASM targets.
 #[cfg(not(target_arch = "wasm32"))]
+#[macro_use]
 extern crate std;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -21,7 +22,7 @@ pub mod rate_limit;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stellar;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env, Vec,
 };
 
 #[contracttype]
@@ -45,6 +46,15 @@ pub enum DataKey {
     Document(BytesN<32>),
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DocumentInfo {
+    pub owner: Address,
+    pub document_hash: BytesN<32>,
+}
+
+pub const MAX_BATCH_SIZE: u32 = 20;
+
 /// Enumeration of all error conditions that can occur within the ProofStell contract.
 ///
 /// Each variant maps to a unique numeric code for Soroban client interoperability,
@@ -59,6 +69,8 @@ pub enum DataKey {
 /// | `AlreadyRevoked`       | 4    | The document has already been revoked                    |
 /// | `InvalidOwner`         | 5    | The provided owner address is not valid for this op      |
 /// | `InvalidIssuer`        | 6    | The provided issuer address is not valid for this op     |
+/// | `BatchTooLarge`        | 7    | Batch exceeds the 20-document limit                      |
+/// | `BatchEmpty`           | 8    | Batch input is empty                                     |
 #[contracterror]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -74,6 +86,10 @@ pub enum ContractError {
     InvalidOwner = 5,
     /// The provided issuer address failed validation. Code: 6
     InvalidIssuer = 6,
+    /// The batch exceeds the maximum allowed size (20). Code: 7
+    BatchTooLarge = 7,
+    /// The batch is empty. Code: 8
+    BatchEmpty = 8,
 }
 
 #[contractevent(topics = ["register"], data_format = "vec")]
@@ -256,6 +272,133 @@ impl ProofStellContract {
 
         Ok(record)
     }
+
+    /// Registers multiple documents in a single atomic transaction.
+    ///
+    /// The issuer authorizes once for the entire batch. All documents must be
+    /// valid or the entire batch fails — no partial state is written.
+    ///
+    /// # Arguments
+    /// * `env`       - The Soroban environment
+    /// * `issuer`    - Address of the entity registering the documents (must authorize)
+    /// * `documents` - Vector of [`DocumentInfo`] (owner + hash pairs), max 20 items
+    ///
+    /// # Returns
+    /// A vector of newly created [`DocumentRecord`]s, all with `DocumentStatus::Active`
+    ///
+    /// # Errors
+    /// * [`ContractError::BatchEmpty`]       — if the vector is empty
+    /// * [`ContractError::BatchTooLarge`]    — if the vector exceeds 20 items
+    /// * [`ContractError::AlreadyRegistered`] — if any document hash is already registered
+    pub fn batch_register_documents(
+        env: Env,
+        issuer: Address,
+        documents: Vec<DocumentInfo>,
+    ) -> Result<Vec<DocumentRecord>, ContractError> {
+        issuer.require_auth();
+
+        if documents.is_empty() {
+            return Err(ContractError::BatchEmpty);
+        }
+        if documents.len() > MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        let mut records = Vec::new(&env);
+
+        for doc in documents.iter() {
+            let key = DataKey::Document(doc.document_hash.clone());
+
+            if env.storage().persistent().has(&key) {
+                return Err(ContractError::AlreadyRegistered);
+            }
+
+            let record = DocumentRecord {
+                issuer: issuer.clone(),
+                owner: doc.owner.clone(),
+                timestamp: env.ledger().timestamp(),
+                status: DocumentStatus::Active,
+            };
+
+            env.storage().persistent().set(&key, &record);
+            DocumentRegistered {
+                issuer: issuer.clone(),
+                owner: doc.owner.clone(),
+                document_hash: doc.document_hash.clone(),
+            }
+            .publish(&env);
+
+            records.push_back(record);
+        }
+
+        Ok(records)
+    }
+
+    /// Revokes multiple documents in a single atomic transaction.
+    ///
+    /// The issuer authorizes once for the entire batch. All documents must be
+    /// revocable or the entire batch fails — no partial state is written.
+    ///
+    /// # Arguments
+    /// * `env`            - The Soroban environment
+    /// * `issuer`         - Address of the original issuer (must authorize)
+    /// * `document_hashes` - Vector of 32-byte document hashes to revoke, max 20 items
+    ///
+    /// # Returns
+    /// A vector of updated [`DocumentRecord`]s, all with `DocumentStatus::Revoked`
+    ///
+    /// # Errors
+    /// * [`ContractError::BatchEmpty`]          — if the vector is empty
+    /// * [`ContractError::BatchTooLarge`]       — if the vector exceeds 20 items
+    /// * [`ContractError::DocumentNotFound`]    — if any hash has no record
+    /// * [`ContractError::OnlyIssuerCanRevoke`] — if the caller is not the original issuer of any document
+    /// * [`ContractError::AlreadyRevoked`]      — if any document is already revoked
+    pub fn batch_revoke_documents(
+        env: Env,
+        issuer: Address,
+        document_hashes: Vec<BytesN<32>>,
+    ) -> Result<Vec<DocumentRecord>, ContractError> {
+        issuer.require_auth();
+
+        if document_hashes.is_empty() {
+            return Err(ContractError::BatchEmpty);
+        }
+        if document_hashes.len() > MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        let mut records = Vec::new(&env);
+
+        for document_hash in document_hashes.iter() {
+            let key = DataKey::Document(document_hash.clone());
+
+            let mut record: DocumentRecord = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(ContractError::DocumentNotFound)?;
+
+            if record.issuer != issuer {
+                return Err(ContractError::OnlyIssuerCanRevoke);
+            }
+
+            if record.status == DocumentStatus::Revoked {
+                return Err(ContractError::AlreadyRevoked);
+            }
+
+            record.status = DocumentStatus::Revoked;
+            env.storage().persistent().set(&key, &record);
+            DocumentRevoked {
+                issuer: issuer.clone(),
+                document_hash: document_hash.clone(),
+            }
+            .publish(&env);
+
+            records.push_back(record);
+        }
+
+        Ok(records)
+    }
 }
 
 #[cfg(test)]
@@ -418,5 +561,200 @@ mod tests {
         client.register_document(&issuer, &owner, &document_hash);
 
         assert!(client.document_exists(&document_hash));
+    }
+
+    // --- batch_register_documents ---
+
+    #[test]
+    fn batch_register_all_succeed() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let docs = soroban_sdk::vec![
+            &env,
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[1; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[2; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+        ];
+
+        let records = client.batch_register_documents(&issuer, &docs);
+
+        assert_eq!(records.len(), 3);
+        for record in records.iter() {
+            assert_eq!(record.status, DocumentStatus::Active);
+            assert_eq!(record.issuer, issuer);
+        }
+    }
+
+    #[test]
+    fn batch_register_fails_on_duplicate() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let docs = soroban_sdk::vec![
+            &env,
+            DocumentInfo { owner: owner.clone(), document_hash: BytesN::from_array(&env, &[3; 32]) },
+            DocumentInfo { owner: owner.clone(), document_hash: hash1.clone() },
+            DocumentInfo { owner: owner.clone(), document_hash: hash2.clone() },
+        ];
+
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRegistered);
+        // hash2 must not have been stored (batch was atomic)
+        assert!(!client.document_exists(&hash2));
+    }
+
+    #[test]
+    fn batch_register_rejects_empty() {
+        let (env, client, issuer, _, _) = setup();
+
+        let docs: soroban_sdk::Vec<DocumentInfo> = soroban_sdk::vec![&env];
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchEmpty);
+    }
+
+    #[test]
+    fn batch_register_rejects_oversized() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let mut docs = soroban_sdk::vec![&env];
+        for i in 0..21u8 {
+            docs.push_back(DocumentInfo {
+                owner: owner.clone(),
+                document_hash: BytesN::from_array(&env, &[i; 32]),
+            });
+        }
+
+        let err = client
+            .try_batch_register_documents(&issuer, &docs)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchTooLarge);
+    }
+
+    // --- batch_revoke_documents ---
+
+    #[test]
+    fn batch_revoke_all_succeed() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hashes = [
+            BytesN::from_array(&env, &[1; 32]),
+            BytesN::from_array(&env, &[2; 32]),
+            BytesN::from_array(&env, &[3; 32]),
+        ];
+        for h in &hashes {
+            client.register_document(&issuer, &owner, h);
+        }
+
+        let hash_vec = soroban_sdk::vec![&env, hashes[0].clone(), hashes[1].clone(), hashes[2].clone()];
+        let records = client.batch_revoke_documents(&issuer, &hash_vec);
+
+        assert_eq!(records.len(), 3);
+        for record in records.iter() {
+            assert_eq!(record.status, DocumentStatus::Revoked);
+        }
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_missing() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash_missing = BytesN::from_array(&env, &[99; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+
+        let hash_vec = soroban_sdk::vec![&env, hash1.clone(), hash_missing];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::DocumentNotFound);
+        // hash1 must still be Active (batch was atomic)
+        assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_wrong_issuer() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+
+        let other = Address::generate(&env);
+        let hash_vec = soroban_sdk::vec![&env, hash1.clone(), hash2.clone()];
+        let err = client
+            .try_batch_revoke_documents(&other, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::OnlyIssuerCanRevoke);
+        assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_fails_on_already_revoked() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let hash1 = BytesN::from_array(&env, &[1; 32]);
+        let hash2 = BytesN::from_array(&env, &[2; 32]);
+        client.register_document(&issuer, &owner, &hash1);
+        client.register_document(&issuer, &owner, &hash2);
+        client.revoke_document(&issuer, &hash1);
+
+        let hash_vec = soroban_sdk::vec![&env, hash1, hash2.clone()];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::AlreadyRevoked);
+        assert_eq!(client.get_document_status(&hash2), DocumentStatus::Active);
+    }
+
+    #[test]
+    fn batch_revoke_rejects_empty() {
+        let (_env, client, issuer, _, _) = setup();
+
+        let hash_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::vec![&_env];
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchEmpty);
+    }
+
+    #[test]
+    fn batch_revoke_rejects_oversized() {
+        let (env, client, issuer, owner, _) = setup();
+
+        let mut hash_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::vec![&env];
+        for i in 0..21u8 {
+            let h = BytesN::from_array(&env, &[i; 32]);
+            client.register_document(&issuer, &owner, &h);
+            hash_vec.push_back(h);
+        }
+
+        let err = client
+            .try_batch_revoke_documents(&issuer, &hash_vec)
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, ContractError::BatchTooLarge);
     }
 }
