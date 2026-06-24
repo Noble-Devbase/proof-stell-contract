@@ -319,12 +319,11 @@ impl EventStore {
     /// Returns the event with its final sequence number populated.
     pub fn append(&mut self, aggregate_id: impl Into<String>, event: Event) -> Event {
         let aggregate_id = aggregate_id.into();
-        let mut events = self.events.entry(aggregate_id.clone()).or_default();
+        let events = self.events.entry(aggregate_id.clone()).or_default();
 
         let sequence = events.len() as u64 + 1;
         let mut finalized = event.with_sequence(sequence);
         finalized.aggregate_id = aggregate_id;
-        finalized.idempotency_key = finalized.idempotency_key;
 
         events.push(finalized.clone());
 
