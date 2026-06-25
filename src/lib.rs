@@ -1,9 +1,6 @@
 #![no_std]
 
-extern crate alloc;
-
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env};
-
+// The service-side modules require std and are only available on non-WASM targets.
 #[cfg(not(target_arch = "wasm32"))]
 #[macro_use]
 extern crate std;
@@ -30,7 +27,7 @@ use soroban_sdk::{
 };
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DocumentStatus {
     Active,
     Revoked,
@@ -48,39 +45,6 @@ pub struct DocumentRecord {
 #[contracttype]
 pub enum DataKey {
     Document(BytesN<32>),
-    EventCount(BytesN<32>),
-    Event(BytesN<32>, u64),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
-pub enum EventType {
-    DocumentRegistered,
-    DocumentRevoked,
-    DocumentVerified,
-    DocumentAuthorizationFailed,
-    DocumentOwnerChanged,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
-pub enum AuthFailureReason {
-    DocumentNotFound,
-    NotIssuer,
-    AlreadyRevoked,
-    NotOwner,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContractEventRecord {
-    pub sequence: u64,
-    pub timestamp: u64,
-    pub actor: Address,
-    pub event_type: EventType,
-    pub auth_failure_reason: u32,
-}
-
     Admin,
     Version,
     FeatureFlag(Symbol),
@@ -120,11 +84,17 @@ pub const MAX_BATCH_SIZE: u32 = 20;
 #[contracterror]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
+    /// No record exists for the provided document hash. Code: 1
     DocumentNotFound = 1,
+    /// A document with this hash is already registered. Code: 2
     AlreadyRegistered = 2,
+    /// The caller is not the original issuer and cannot perform this action. Code: 3
     OnlyIssuerCanRevoke = 3,
+    /// The document has already been revoked and cannot be revoked again. Code: 4
     AlreadyRevoked = 4,
+    /// The provided owner address failed validation. Code: 5
     InvalidOwner = 5,
+    /// The provided issuer address failed validation. Code: 6
     InvalidIssuer = 6,
     /// The batch exceeds the maximum allowed size (20). Code: 7
     BatchTooLarge = 7,
@@ -139,8 +109,6 @@ pub enum ContractError {
     /// The contract is already at the latest version; no migration is needed. Code: 12
     MigrationNotNeeded = 12,
 }
-
-const NONE_REASON: u32 = u32::MAX;
 
 #[contractevent(topics = ["register"], data_format = "vec")]
 pub struct DocumentRegistered {
@@ -157,29 +125,6 @@ pub struct DocumentRevoked {
     pub document_hash: BytesN<32>,
 }
 
-#[contractevent(topics = ["verify"], data_format = "vec")]
-pub struct DocumentVerified {
-    #[topic]
-    pub actor: Address,
-    pub document_hash: BytesN<32>,
-    pub status: DocumentStatus,
-}
-
-#[contractevent(topics = ["auth_failed"], data_format = "vec")]
-pub struct DocumentAuthorizationFailed {
-    #[topic]
-    pub actor: Address,
-    pub document_hash: BytesN<32>,
-    pub reason: AuthFailureReason,
-}
-
-#[contractevent(topics = ["owner_changed"], data_format = "vec")]
-pub struct DocumentOwnerChanged {
-    #[topic]
-    pub actor: Address,
-    pub document_hash: BytesN<32>,
-    pub previous_owner: Address,
-    pub new_owner: Address,
 #[contractevent(topics = ["init"], data_format = "vec")]
 pub struct ContractInitialized {
     #[topic]
@@ -200,41 +145,21 @@ pub struct ProofStellContract;
 
 #[contractimpl]
 impl ProofStellContract {
-    fn emit_event(
-        env: &Env,
-        document_hash: &BytesN<32>,
-        actor: &Address,
-        event_type: EventType,
-        auth_failure_reason: Option<AuthFailureReason>,
-    ) {
-        let count_key = DataKey::EventCount(document_hash.clone());
-        let next_sequence: u64 = env.storage().persistent().get(&count_key).unwrap_or(0) + 1;
-        env.storage().persistent().set(&count_key, &next_sequence);
-
-        let event_key = DataKey::Event(document_hash.clone(), next_sequence);
-        let timestamp = env.ledger().timestamp();
-
-        let record = ContractEventRecord {
-            sequence: next_sequence,
-            timestamp,
-            actor: actor.clone(),
-            event_type,
-            auth_failure_reason: auth_failure_reason.map(|r| r as u32).unwrap_or(NONE_REASON),
-        };
-
-        env.storage().persistent().set(&event_key, &record);
-    }
-
-    pub fn get_document_event_count(env: Env, document_hash: BytesN<32>) -> u64 {
-        let count_key = DataKey::EventCount(document_hash);
-        env.storage().persistent().get(&count_key).unwrap_or(0)
-    }
-
-    pub fn get_document_event(env: Env, document_hash: BytesN<32>, index: u64) -> Option<ContractEventRecord> {
-        let event_key = DataKey::Event(document_hash, index);
-        env.storage().persistent().get(&event_key)
-    }
-
+    /// Registers a new document on-chain, associating it with an issuer and owner.
+    ///
+    /// The issuer must authorize this call. Each document hash can only be registered once.
+    ///
+    /// # Arguments
+    /// * `env`           - The Soroban environment
+    /// * `issuer`        - Address of the entity registering the document (must authorize)
+    /// * `owner`         - Address of the document's owner
+    /// * `document_hash` - 32-byte unique hash identifying the document
+    ///
+    /// # Returns
+    /// The newly created [`DocumentRecord`] with `DocumentStatus::Active`
+    ///
+    /// # Errors
+    /// * [`ContractError::AlreadyRegistered`] — if a record already exists for this hash
     pub fn register_document(
         env: Env,
         issuer: Address,
@@ -257,15 +182,6 @@ impl ProofStellContract {
         };
 
         env.storage().persistent().set(&key, &record);
-
-        Self::emit_event(
-            &env,
-            &document_hash,
-            &issuer,
-            EventType::DocumentRegistered,
-            None,
-        );
-
         DocumentRegistered {
             issuer,
             owner: record.owner.clone(),
@@ -276,58 +192,43 @@ impl ProofStellContract {
         Ok(record)
     }
 
+    /// Retrieves a document record by its hash from persistent storage.
+    ///
+    /// # Arguments
+    /// * `env`           - The Soroban environment
+    /// * `document_hash` - 32-byte hash identifying the document
+    ///
+    /// # Returns
+    /// `Some(DocumentRecord)` if found, `None` otherwise
     pub fn get_document(env: Env, document_hash: BytesN<32>) -> Option<DocumentRecord> {
         let key = DataKey::Document(document_hash);
         env.storage().persistent().get(&key)
     }
 
-    pub fn verify_document(
-        env: Env,
-        caller: Address,
-        document_hash: BytesN<32>,
-    ) -> Result<DocumentStatus, ContractError> {
-        let key = DataKey::Document(document_hash.clone());
-        let record: DocumentRecord = match env.storage().persistent().get(&key) {
-            Some(r) => r,
-            None => {
-                let reason = AuthFailureReason::DocumentNotFound;
-                Self::emit_event(
-                    &env,
-                    &document_hash,
-                    &caller,
-                    EventType::DocumentAuthorizationFailed,
-                    Some(reason),
-                );
-                DocumentAuthorizationFailed {
-                    actor: caller,
-                    document_hash,
-                    reason,
-                }
-                .publish(&env);
-                return Err(ContractError::DocumentNotFound);
-            }
-        };
-
-        let status = record.status;
-
-        Self::emit_event(
-            &env,
-            &document_hash,
-            &caller,
-            EventType::DocumentVerified,
-            None,
-        );
-
-        DocumentVerified {
-            actor: caller,
-            document_hash,
-            status,
-        }
-        .publish(&env);
-
-        Ok(status)
+    /// Checks whether a document exists and is currently active.
+    ///
+    /// # Arguments
+    /// * `env`           - The Soroban environment
+    /// * `document_hash` - 32-byte hash identifying the document
+    ///
+    /// # Returns
+    /// `true` only if the document exists and has `DocumentStatus::Active`
+    pub fn verify_document(env: Env, document_hash: BytesN<32>) -> bool {
+        let key = DataKey::Document(document_hash);
+        env.storage()
+            .persistent()
+            .get::<DataKey, DocumentRecord>(&key)
+            .map_or(false, |record| record.status == DocumentStatus::Active)
     }
 
+    /// Returns the status of a document, or an error if it does not exist.
+    ///
+    /// # Arguments
+    /// * `env`           - The Soroban environment
+    /// * `document_hash` - 32-byte hash identifying the document
+    ///
+    /// # Errors
+    /// * [`ContractError::DocumentNotFound`] — if no record exists for the given hash
     pub fn get_document_status(
         env: Env,
         document_hash: BytesN<32>,
@@ -340,11 +241,36 @@ impl ProofStellContract {
             .ok_or(ContractError::DocumentNotFound)
     }
 
+    /// Checks whether a document exists in storage, regardless of its status.
+    ///
+    /// # Arguments
+    /// * `env`           - The Soroban environment
+    /// * `document_hash` - 32-byte hash identifying the document
+    ///
+    /// # Returns
+    /// `true` if any record (active or revoked) is stored under this hash
     pub fn document_exists(env: Env, document_hash: BytesN<32>) -> bool {
         let key = DataKey::Document(document_hash);
         env.storage().persistent().has(&key)
     }
 
+    /// Revokes a previously registered document, preventing future verification.
+    ///
+    /// Only the original issuer of the document may revoke it. A document that has
+    /// already been revoked cannot be revoked again.
+    ///
+    /// # Arguments
+    /// * `env`           - The Soroban environment
+    /// * `issuer`        - Address of the original issuer (must authorize)
+    /// * `document_hash` - 32-byte hash identifying the document to revoke
+    ///
+    /// # Returns
+    /// The updated [`DocumentRecord`] with `DocumentStatus::Revoked`
+    ///
+    /// # Errors
+    /// * [`ContractError::DocumentNotFound`]    — if no record exists for this hash
+    /// * [`ContractError::OnlyIssuerCanRevoke`] — if the caller is not the original issuer
+    /// * [`ContractError::AlreadyRevoked`]      — if the document is already revoked
     pub fn revoke_document(
         env: Env,
         issuer: Address,
@@ -354,75 +280,23 @@ impl ProofStellContract {
 
         let key = DataKey::Document(document_hash.clone());
 
-        let mut record: DocumentRecord = match env.storage().persistent().get(&key) {
-            Some(r) => r,
-            None => {
-                let reason = AuthFailureReason::DocumentNotFound;
-                Self::emit_event(
-                    &env,
-                    &document_hash,
-                    &issuer,
-                    EventType::DocumentAuthorizationFailed,
-                    Some(reason),
-                );
-                DocumentAuthorizationFailed {
-                    actor: issuer,
-                    document_hash,
-                    reason,
-                }
-                .publish(&env);
-                return Err(ContractError::DocumentNotFound);
-            }
-        };
+        let mut record: DocumentRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::DocumentNotFound)?;
 
         if record.issuer != issuer {
-            let reason = AuthFailureReason::NotIssuer;
-            Self::emit_event(
-                &env,
-                &document_hash,
-                &issuer,
-                EventType::DocumentAuthorizationFailed,
-                Some(reason),
-            );
-            DocumentAuthorizationFailed {
-                actor: issuer,
-                document_hash,
-                reason,
-            }
-            .publish(&env);
             return Err(ContractError::OnlyIssuerCanRevoke);
         }
 
         if record.status == DocumentStatus::Revoked {
-            let reason = AuthFailureReason::AlreadyRevoked;
-            Self::emit_event(
-                &env,
-                &document_hash,
-                &issuer,
-                EventType::DocumentAuthorizationFailed,
-                Some(reason),
-            );
-            DocumentAuthorizationFailed {
-                actor: issuer,
-                document_hash,
-                reason,
-            }
-            .publish(&env);
             return Err(ContractError::AlreadyRevoked);
         }
 
         record.status = DocumentStatus::Revoked;
 
         env.storage().persistent().set(&key, &record);
-
-        Self::emit_event(
-            &env,
-            &document_hash,
-            &issuer,
-            EventType::DocumentRevoked,
-            None,
-        );
-
         DocumentRevoked {
             issuer,
             document_hash,
@@ -432,77 +306,6 @@ impl ProofStellContract {
         Ok(record)
     }
 
-    pub fn change_owner(
-        env: Env,
-        current_owner: Address,
-        document_hash: BytesN<32>,
-        new_owner: Address,
-    ) -> Result<DocumentRecord, ContractError> {
-        current_owner.require_auth();
-
-        let key = DataKey::Document(document_hash.clone());
-
-        let mut record: DocumentRecord = match env.storage().persistent().get(&key) {
-            Some(r) => r,
-            None => {
-                let reason = AuthFailureReason::DocumentNotFound;
-                Self::emit_event(
-                    &env,
-                    &document_hash,
-                    &current_owner,
-                    EventType::DocumentAuthorizationFailed,
-                    Some(reason),
-                );
-                DocumentAuthorizationFailed {
-                    actor: current_owner,
-                    document_hash,
-                    reason,
-                }
-                .publish(&env);
-                return Err(ContractError::DocumentNotFound);
-            }
-        };
-
-        if record.owner != current_owner {
-            let reason = AuthFailureReason::NotOwner;
-            Self::emit_event(
-                &env,
-                &document_hash,
-                &current_owner,
-                EventType::DocumentAuthorizationFailed,
-                Some(reason),
-            );
-            DocumentAuthorizationFailed {
-                actor: current_owner,
-                document_hash,
-                reason,
-            }
-            .publish(&env);
-            return Err(ContractError::InvalidOwner);
-        }
-
-        let previous_owner = record.owner.clone();
-        record.owner = new_owner.clone();
-
-        env.storage().persistent().set(&key, &record);
-
-        Self::emit_event(
-            &env,
-            &document_hash,
-            &current_owner,
-            EventType::DocumentOwnerChanged,
-            None,
-        );
-
-        DocumentOwnerChanged {
-            actor: current_owner,
-            document_hash,
-            previous_owner,
-            new_owner,
-        }
-        .publish(&env);
-
-        Ok(record)
     /// Registers multiple documents in a single atomic transaction.
     ///
     /// The issuer authorizes once for the entire batch. All documents must be
@@ -817,7 +620,13 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Address, Env};
 
-    fn setup() -> (Env, ProofStellContractClient<'static>, Address, Address, BytesN<32>) {
+    fn setup() -> (
+        Env,
+        ProofStellContractClient<'static>,
+        Address,
+        Address,
+        BytesN<32>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -839,8 +648,7 @@ mod tests {
         assert_eq!(record.issuer, issuer);
         assert_eq!(record.owner, owner);
         assert_eq!(record.status, DocumentStatus::Active);
-        let status = client.verify_document(&issuer, &document_hash);
-        assert_eq!(status, DocumentStatus::Active);
+        assert!(client.verify_document(&document_hash));
     }
 
     #[test]
@@ -860,8 +668,7 @@ mod tests {
         let record = client.revoke_document(&issuer, &document_hash);
 
         assert_eq!(record.status, DocumentStatus::Revoked);
-        let status = client.verify_document(&issuer, &document_hash);
-        assert_eq!(status, DocumentStatus::Revoked);
+        assert!(!client.verify_document(&document_hash));
     }
 
     #[test]
@@ -968,88 +775,6 @@ mod tests {
         assert!(client.document_exists(&document_hash));
     }
 
-    #[test]
-    fn event_emission_records_document_registered() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-
-        let count = client.get_document_event_count(&document_hash);
-        assert_eq!(count, 1);
-        let event = client.get_document_event(&document_hash, &1).unwrap();
-        assert!(matches!(
-            event.event_type,
-            EventType::DocumentRegistered
-        ));
-        assert_eq!(event.actor, issuer);
-        assert_eq!(event.sequence, 1);
-    }
-
-    #[test]
-    fn event_emission_records_document_revoked() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-        client.revoke_document(&issuer, &document_hash);
-
-        let count = client.get_document_event_count(&document_hash);
-        assert_eq!(count, 2);
-        let event = client.get_document_event(&document_hash, &2).unwrap();
-        assert!(matches!(
-            event.event_type,
-            EventType::DocumentRevoked
-        ));
-        assert_eq!(event.actor, issuer);
-        assert_eq!(event.sequence, 2);
-    }
-
-    #[test]
-    fn event_emission_records_document_verified() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-        let status = client.verify_document(&issuer, &document_hash);
-
-        assert_eq!(status, DocumentStatus::Active);
-        let event = client.get_document_event(&document_hash, &2).unwrap();
-        assert!(matches!(
-            event.event_type,
-            EventType::DocumentVerified
-        ));
-        assert_eq!(event.actor, issuer);
-    }
-
-    #[test]
-    fn event_emission_records_document_verified_for_revoked_document() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-        client.revoke_document(&issuer, &document_hash);
-        let status = client.verify_document(&issuer, &document_hash);
-
-        assert_eq!(status, DocumentStatus::Revoked);
-        let count = client.get_document_event_count(&document_hash);
-        assert!(count >= 2);
-    }
-
-    #[test]
-    fn event_emission_records_auth_failure_for_missing_document() {
-        let (_env, client, issuer, _owner, document_hash) = setup();
-
-        let err = client
-            .try_verify_document(&issuer, &document_hash)
-            .unwrap_err()
-            .unwrap();
-
-        assert_eq!(err, ContractError::DocumentNotFound);
-    }
-
-    #[test]
-    fn event_emission_records_auth_failure_for_missing_document_on_revoke() {
-        let (_env, client, issuer, _owner, document_hash) = setup();
-
-        let err = client
-            .try_revoke_document(&issuer, &document_hash)
     // --- batch_register_documents ---
 
     #[test]
@@ -1169,18 +894,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(err, ContractError::DocumentNotFound);
-    }
-
-    #[test]
-    fn event_emission_records_auth_failure_for_non_issuer_revoke() {
-        let (env, client, _issuer, owner, document_hash) = setup();
-
-        let other = Address::generate(&env);
-        client.register_document(&other, &owner, &document_hash);
-        client.revoke_document(&other, &document_hash);
-
-        let err = client
-            .try_revoke_document(&owner, &document_hash)
         // hash1 must still be Active (batch was atomic)
         assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
     }
@@ -1202,19 +915,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(err, ContractError::OnlyIssuerCanRevoke);
-        let count = client.get_document_event_count(&document_hash);
-        assert!(count >= 2);
-    }
-
-    #[test]
-    fn event_emission_records_auth_failure_for_already_revoked() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-        client.revoke_document(&issuer, &document_hash);
-
-        let err = client
-            .try_revoke_document(&issuer, &document_hash)
         assert_eq!(client.get_document_status(&hash1), DocumentStatus::Active);
     }
 
@@ -1235,98 +935,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(err, ContractError::AlreadyRevoked);
-        let count = client.get_document_event_count(&document_hash);
-        assert!(count >= 2);
-    }
-
-    #[test]
-    fn event_emission_records_auth_failure_for_missing_document_on_change_owner() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        let err = client
-            .try_change_owner(&owner, &document_hash, &owner)
-            .unwrap_err()
-            .unwrap();
-
-        assert_eq!(err, ContractError::DocumentNotFound);
-    }
-
-    #[test]
-    fn event_emission_records_auth_failure_for_non_owner_change() {
-        let (env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-
-        let other = Address::generate(&env);
-        let err = client
-            .try_change_owner(&other, &document_hash, &other)
-            .unwrap_err()
-            .unwrap();
-
-        assert_eq!(err, ContractError::InvalidOwner);
-    }
-
-    #[test]
-    fn event_record_includes_timestamp() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-
-        let event = client.get_document_event(&document_hash, &1).unwrap();
-        assert_eq!(event.timestamp, 0);
-    }
-
-    #[test]
-    fn auth_failure_reason_is_none_for_success_events() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-
-        let event = client.get_document_event(&document_hash, &1).unwrap();
-        assert_eq!(event.auth_failure_reason, NONE_REASON);
-    }
-
-    #[test]
-    fn event_emission_records_document_owner_changed() {
-        let (env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-        let new_owner = Address::generate(&env);
-        let record = client.change_owner(&owner, &document_hash, &new_owner);
-
-        assert_eq!(record.owner, new_owner);
-        let event = client.get_document_event(&document_hash, &2).unwrap();
-        assert!(matches!(
-            event.event_type,
-            EventType::DocumentOwnerChanged
-        ));
-        assert_eq!(event.actor, owner);
-    }
-
-    #[test]
-    fn event_sequence_ordering() {
-        let (_env, client, issuer, owner, document_hash) = setup();
-
-        client.register_document(&issuer, &owner, &document_hash);
-        client.verify_document(&issuer, &document_hash);
-        client.verify_document(&issuer, &document_hash);
-
-        let event1 = client.get_document_event(&document_hash, &1).unwrap();
-        let event2 = client.get_document_event(&document_hash, &2).unwrap();
-        let event3 = client.get_document_event(&document_hash, &3).unwrap();
-        assert_eq!(event1.sequence, 1);
-        assert_eq!(event2.sequence, 2);
-        assert_eq!(event3.sequence, 3);
-    }
-
-    #[test]
-    fn get_document_event_returns_none_for_missing() {
-        let (_env, client, _issuer, _owner, document_hash) = setup();
-
-        let event = client.get_document_event(&document_hash, &1);
-        assert!(event.is_none());
-    }
-}
         assert_eq!(client.get_document_status(&hash2), DocumentStatus::Active);
     }
 
